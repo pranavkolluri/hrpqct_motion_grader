@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Models and weights
+models/tibia/stage1/*/
+models/tibia/stage2/*/
+models/radius/stage1/*/
+models/radius/stage2/*/
+*.pt
+*.pth
+
+# Logs and operator data
+logs/
+
+# Training outputs
+models/ensemble/
+
+# Dataset (large binary files)
+*.npy
+*.xlsx
+*.isq
+*.ISQ
+
+# MLflow
+mlruns/
+
+# Temp files from dataset building
+*_resolved_paths.csv
+*_resolved_for_inference.csv
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
