@@ -43,7 +43,7 @@ GRADE_BIN_LABELS = {
 # 'cpu' is recommended for the grading app — inference on individual scans is
 # fast enough and avoids CUDA version mismatch issues on operator workstations.
 # Set to 'cuda' only if you have a matching PyTorch/CUDA build and need speed.
-INFERENCE_DEVICE = "cpu"
+INFERENCE_DEVICE = "cuda"
 
 # ── Confidence threshold ──────────────────────────────────────────────────────
 # Scans below this confidence are flagged yellow in the review table.
