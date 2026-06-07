@@ -144,7 +144,7 @@ class CascadePredictor:
         if not s2_dir.exists() or not any(s2_dir.rglob("model_*.pt")):
             raise FileNotFoundError(f"Stage 2 models not found at {s2_dir}")
 
-        print(f"  Loading {bone_type} stage1 from {s1_dir.name}...")
+        print(f"  Loading {bone_type} stage 1 and 2 from {s1_dir} and {s2_dir}...")
         self._models[bone_type] = {
             'stage1': _load_models(s1_dir, num_classes=2, arch=self.arch, device=self.device),
             'stage2': _load_models(s2_dir, num_classes=2, arch=self.arch, device=self.device),
