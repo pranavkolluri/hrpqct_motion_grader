@@ -29,6 +29,8 @@ ARCH = "efficientnet"
 
 # ── Preprocessing ─────────────────────────────────────────────────────────────
 EDGE_FILTER = True       # Apply Sobel edge filter (must match training setting)
+EDGE_BLEND = 0.5         # Edge-vs-raw blend weight (must match the deployed model's config.json)
+EDGE_LEGACY = False      # True only for models trained before the blend/fixed-scale change
 CROP_SIZE = 1024         # ISQ crop size in pixels
 
 # ── Grade bin labels (shown to operators) ─────────────────────────────────────

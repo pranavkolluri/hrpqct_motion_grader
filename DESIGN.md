@@ -35,7 +35,7 @@ The classifier uses two binary stages rather than a single three-class model. Th
 
 Confidence is reported as the average softmax probability of the winning class across all slices. Scans below the threshold set in `config.py` are flagged for operator attention.
 
-Both stages use EfficientNet-B0 with a grayscale-adapted stem (3-channel weights averaged to 1-channel). A Sobel edge filter is optionally applied before each forward pass to highlight structural blur patterns consistent with how technicians manually assess motion.
+Both stages use EfficientNet-B0 with a grayscale-adapted stem (3-channel weights averaged to 1-channel). A Sobel edge filter is optionally applied before each forward pass to highlight structural blur patterns consistent with how technicians manually assess motion. By default the edge map is blended with the raw slice (`x' = (1 - edge_blend) * raw + edge_blend * edge`, gradient magnitude normalized by a fixed scale) rather than replacing it outright, so diffuse/smooth motion blur — which shows up as a loss of local contrast rather than a strong gradient — isn't discarded before the model ever sees it. Set `--edge_legacy` to reproduce the original edge-only behavior for comparison against models trained before this change.
 
 ---
 
@@ -90,6 +90,8 @@ All system-wide settings live in `config.py`. This is the only file that needs t
 ISQ_ROOT = r"Y:\data"               # Mounted XCT drive root
 ARCH = "efficientnet"               # Model architecture used during training
 EDGE_FILTER = True                  # Whether Sobel filter was used during training
+EDGE_BLEND = 0.5                    # Edge-vs-raw blend weight, must match training config.json
+EDGE_LEGACY = False                 # True only for models trained before the blend/fixed-scale change
 CROP_SIZE = 1024                    # ISQ crop size in pixels
 
 MODELS = {
@@ -114,7 +116,7 @@ LOG_FILE = r"logs/grading_log.csv"
 DEBUG_DATASET_DIR = None           # Set to a .npy dataset path to enable debug mode
 ```
 
-The `ARCH` and `EDGE_FILTER` values must match what was used during training. Mismatches will not cause an error at load time but will produce incorrect predictions.
+The `ARCH`, `EDGE_FILTER`, `EDGE_BLEND`, and `EDGE_LEGACY` values must match what was used during training (recorded in the training run's `config.json`). Mismatches will not cause an error at load time but will produce incorrect predictions.
 
 ---
 
@@ -228,11 +230,14 @@ python training\train_cascade.py `
   --bone_type Tibia `
   --arch efficientnet `
   --edge_filter `
+  --edge_blend 0.5 `
   --n_folds 5 `
   --num_models 1 `
   --num_epochs_s1 15 `
   --num_epochs_s2 20
 ```
+
+Add `--edge_legacy` instead of `--edge_blend` to reproduce the original edge-only behavior (raw image discarded, gradient magnitude stretched per-slice) for A/B comparison against models trained before this change.
 
 This trains Stage 1 (Grade 1 vs Rest) and Stage 2 (Grade 2 vs Grade 3-5) using stratified k-fold cross-validation, then runs a full cascade evaluation with no data leakage (each scan is evaluated by the fold model that never saw it during training). Results are saved under `models/ensemble/`.
 
@@ -353,6 +358,9 @@ EfficientNet-B0 pretrained on ImageNet extracts richer texture features from lim
 
 **Why a Sobel edge filter?**
 Technicians assess motion grade primarily by examining structural edge sharpness. Motion artifacts manifest as blur and streaking at bone boundaries. The Sobel filter makes this signal explicit to the model and is consistent with the manual assessment process.
+
+**Why blend the edge map with the raw image instead of replacing it?**
+Not all motion artifacts are sharp-edge phenomena — diffuse blur and low-contrast smearing reduce local contrast everywhere rather than producing a strong gradient anywhere in particular. Replacing the raw slice outright discarded that signal, and made it worse by rescaling gradient magnitude per-slice to fill `[0, 1]`: a uniformly blurry slice (weak gradients everywhere) got stretched to look like it had full-range sharp edges. The current default blends the two (fixed-scale edge map + raw image) instead of replacing, so both cues reach the model.
 
 **Why k-fold cross-validation rather than a single train/test split?**
 With ~300 scans total, a single split wastes too much data on evaluation and produces unstable accuracy estimates. K-fold ensures every scan is evaluated exactly once by a model that never saw it, giving a reliable estimate of generalisation performance across the full dataset.

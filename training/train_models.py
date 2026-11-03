@@ -34,7 +34,8 @@ def _parse_group_map(value: str):
         raise argparse.ArgumentTypeError(f"Invalid --group_map: {value!r}")
 
 
-def _train(dataset_dir, bone_type, num_models, num_epochs, batch_size, group_map, arch, kfold, n_folds, edge_filter, grade_filter):
+def _train(dataset_dir, bone_type, num_models, num_epochs, batch_size, group_map, arch, kfold, n_folds,
+           edge_filter, edge_blend, edge_legacy, grade_filter):
     tag = f"Bone: {bone_type or 'all'} | K-fold: {kfold} | Arch: {arch} | Groups: {group_map}"
     print(f"\n{'='*70}\n{tag}\n{'='*70}")
     if kfold:
@@ -42,7 +43,8 @@ def _train(dataset_dir, bone_type, num_models, num_epochs, batch_size, group_map
             num_models=num_models, dataset_dir=str(dataset_dir), n_splits=n_folds,
             num_epochs=num_epochs, batch_size=batch_size, group_map=group_map,
             max_per_class=2.0, bone_type=bone_type, arch=arch,
-            edge_filter=edge_filter, grade_filter=grade_filter,
+            edge_filter=edge_filter, edge_blend=edge_blend, edge_legacy=edge_legacy,
+            grade_filter=grade_filter,
         )
     else:
         from trainer import ensemble_trainer as _et
@@ -50,7 +52,8 @@ def _train(dataset_dir, bone_type, num_models, num_epochs, batch_size, group_map
             num_models=num_models, dataset_dir=str(dataset_dir),
             num_epochs=num_epochs, batch_size=batch_size, group_map=group_map,
             max_per_class=2.0, bone_type=bone_type, arch=arch,
-            edge_filter=edge_filter, grade_filter=grade_filter,
+            edge_filter=edge_filter, edge_blend=edge_blend, edge_legacy=edge_legacy,
+            grade_filter=grade_filter,
         )
 
 
@@ -67,6 +70,10 @@ def main():
     parser.add_argument("--n_folds", type=int, default=5)
     parser.add_argument("--group_map", type=_parse_group_map, default=DEFAULT_GROUP_MAP, metavar="JSON_OR_NONE")
     parser.add_argument("--edge_filter", action="store_true")
+    parser.add_argument("--edge_blend", type=float, default=0.5,
+                        help="Weight given to the edge map when blending with the raw image (0-1)")
+    parser.add_argument("--edge_legacy", action="store_true",
+                        help="Reproduce the old edge-only, per-slice-normalized behavior (for A/B comparison)")
     parser.add_argument("--grade_filter", type=lambda s: json.loads(s), default=None, metavar="JSON_LIST")
 
     args = parser.parse_args()
@@ -84,7 +91,7 @@ def main():
     for bone in bones:
         _train(dataset_dir, bone, args.num_models, args.num_epochs, args.batch_size,
                args.group_map, args.arch, args.kfold, args.n_folds,
-               args.edge_filter, args.grade_filter)
+               args.edge_filter, args.edge_blend, args.edge_legacy, args.grade_filter)
 
 
 if __name__ == "__main__":

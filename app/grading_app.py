@@ -404,8 +404,6 @@ class ProcessingFrame(ctk.CTkFrame):
                                  if result['confidence'] < config.LOW_CONFIDENCE_THRESHOLD
                                  else 'pending')
                 row['operator_grade']    = [1, 2, 4][result['grade_bin']]
-                row['operator_approved'] = True
-                row['graded_at']         = datetime.now().isoformat(timespec='seconds')
             except Exception as e:
                 row['status']              = 'error'
                 row['machine_grade_label'] = f"Error: {e}"

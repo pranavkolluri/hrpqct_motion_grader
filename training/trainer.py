@@ -3,6 +3,7 @@ Training, evaluation, and fine-tuning for motion grade cascade classifier.
 """
 from __future__ import annotations
 
+import csv
 import gc
 import json
 import os
@@ -19,7 +20,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix
-import mlflow
 
 _THIS = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_THIS)
@@ -49,10 +49,10 @@ def train_model(model, train_loader, criterion, optimizer, val_loader=None,
     model.to(device)
     model.train()
 
-    run_name = f"model_{model_idx + 1}" if model_idx is not None else "model"
-    mlflow.set_experiment(wandb_group or "motion-grade")
-    mlflow.start_run(run_name=run_name)
-    mlflow.log_params({"num_epochs": num_epochs, "model_idx": model_idx})
+    metrics_path = None
+    if ensemble_dir is not None:
+        fname = f"model_{model_idx + 1}_metrics.csv" if model_idx is not None else "metrics.csv"
+        metrics_path = os.path.join(ensemble_dir, fname)
 
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
@@ -81,7 +81,6 @@ def train_model(model, train_loader, criterion, optimizer, val_loader=None,
 
             if torch.isnan(loss):
                 print(f"NaN loss at epoch {epoch + 1} — stopping early")
-                mlflow.end_run()
                 return
 
             running_loss += loss.item()
@@ -90,21 +89,26 @@ def train_model(model, train_loader, criterion, optimizer, val_loader=None,
             total_train += labels.size(0)
             correct_train += (predicted == labels).sum().item()
             pbar.set_postfix({'loss': running_loss / (i + 1), 'acc': 100 * correct_train / total_train})
-            mlflow.log_metric("train_loss", loss.item(), step=epoch * len(train_loader) + i)
 
         train_acc = 100 * correct_train / total_train
         train_accs.append(train_acc)
         train_losses.append(running_loss / len(train_loader))
-        metrics = {"train_accuracy": train_acc, "train_loss": running_loss / len(train_loader)}
+        row = {"phase": wandb_group or "train", "epoch": epoch,
+               "train_loss": running_loss / len(train_loader), "train_accuracy": train_acc}
 
         if val_loader:
             val_acc = evaluate_model(model, val_loader, device)
             val_accs.append(val_acc)
-            metrics["val_accuracy"] = val_acc
+            row["val_accuracy"] = val_acc
 
-        mlflow.log_metrics(metrics, step=epoch)
+        if metrics_path is not None:
+            write_header = not os.path.exists(metrics_path)
+            with open(metrics_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["phase", "epoch", "train_loss", "train_accuracy", "val_accuracy"])
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
 
-    mlflow.end_run()
     print('Finished Training')
 
     if model_idx is not None and ensemble_dir is not None:
@@ -253,13 +257,14 @@ def _scan_level_report(models, test_dataset, full_dataset, fold_dir, fold_idx, n
 def kfold_ensemble_trainer(
     num_models, dataset_dir, n_splits=5, num_epochs=5, batch_size=16,
     group_map=None, max_per_class=2, bone_type=None, arch='custom',
-    edge_filter=False, grade_filter=None,
+    edge_filter=False, edge_blend=0.5, edge_legacy=False, grade_filter=None,
 ):
     """K-fold cross-validation ensemble training. Saves fold models + aggregate report."""
     dataset = HRPQCTDatasetV2(
         dataset_dir, group_map=group_map, downsample_majority=True,
         max_per_class=max_per_class, seed=42, bone_type=bone_type,
-        edge_filter=edge_filter, grade_filter=grade_filter,
+        edge_filter=edge_filter, edge_blend=edge_blend, edge_legacy=edge_legacy,
+        grade_filter=grade_filter,
     )
 
     run_label = os.path.basename(dataset_dir) + (f"_{bone_type.lower()}" if bone_type else "")
@@ -269,7 +274,9 @@ def kfold_ensemble_trainer(
 
     with open(os.path.join(kfold_dir, 'config.json'), 'w') as f:
         json.dump({'arch': arch, 'bone_type': bone_type, 'group_map': group_map,
-                   'n_splits': n_splits, 'edge_filter': edge_filter, 'grade_filter': grade_filter}, f, indent=2)
+                   'n_splits': n_splits, 'edge_filter': edge_filter,
+                   'edge_blend': edge_blend, 'edge_legacy': edge_legacy,
+                   'grade_filter': grade_filter}, f, indent=2)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_y_true, all_y_pred = [], []
@@ -327,7 +334,7 @@ def kfold_finetune_trainer(
     num_models, dataset_dir, pretrained_kfold_dir: str,
     n_splits=5, num_head_epochs=5, num_full_epochs=10, batch_size=16,
     group_map=None, max_per_class=2, bone_type=None, arch='efficientnet',
-    edge_filter=False, grade_filter=None,
+    edge_filter=False, edge_blend=0.5, edge_legacy=False, grade_filter=None,
 ):
     """
     Fine-tune an existing k-fold ensemble on new/expanded data.
@@ -338,7 +345,8 @@ def kfold_finetune_trainer(
     dataset = HRPQCTDatasetV2(
         dataset_dir, group_map=group_map, downsample_majority=True,
         max_per_class=max_per_class, seed=42, bone_type=bone_type,
-        edge_filter=edge_filter, grade_filter=grade_filter,
+        edge_filter=edge_filter, edge_blend=edge_blend, edge_legacy=edge_legacy,
+        grade_filter=grade_filter,
     )
 
     run_label = os.path.basename(dataset_dir) + (f"_{bone_type.lower()}" if bone_type else "") + "_ft"
@@ -349,7 +357,9 @@ def kfold_finetune_trainer(
     with open(os.path.join(kfold_dir, 'config.json'), 'w') as f:
         json.dump({
             'arch': arch, 'bone_type': bone_type, 'group_map': group_map,
-            'n_splits': n_splits, 'edge_filter': edge_filter, 'grade_filter': grade_filter,
+            'n_splits': n_splits, 'edge_filter': edge_filter,
+            'edge_blend': edge_blend, 'edge_legacy': edge_legacy,
+            'grade_filter': grade_filter,
             'finetuned_from': str(pretrained_kfold_dir),
         }, f, indent=2)
 
@@ -441,6 +451,10 @@ def cascade_kfold_eval(
 
     arch = s1_cfg.get('arch', 'custom')
     edge_filter = s1_cfg.get('edge_filter', False)
+    # Old config.json files predate blend/legacy — default to legacy=True so
+    # those already-trained models keep being evaluated the way they were trained.
+    edge_blend = s1_cfg.get('edge_blend', 0.5)
+    edge_legacy = s1_cfg.get('edge_legacy', True)
     n_splits = s1_cfg.get('n_splits', 5)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -506,7 +520,7 @@ def cascade_kfold_eval(
             for idx in slice_indices:
                 x, _ = full_ds[idx]
                 if apply_edge:
-                    x = apply_sobel(x)
+                    x = apply_sobel(x, blend=edge_blend, legacy=edge_legacy)
                 x = x.unsqueeze(0).to(device)
                 ensemble_probs = torch.stack([torch.softmax(m(x), dim=1) for m in models]).mean(0)
                 probs_list.append(ensemble_probs.cpu().numpy()[0])

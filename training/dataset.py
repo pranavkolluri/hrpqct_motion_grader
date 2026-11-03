@@ -18,8 +18,20 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 
-def apply_sobel(x: torch.Tensor) -> torch.Tensor:
-    """Compute Sobel edge magnitude of a (1, H, W) float tensor. Returns [0,1] normalized."""
+# Max |gradient| this kernel pair can produce for an input in [0, 1] (a hard
+# step edge saturates each arm at +/-4). Used as a fixed normalization divisor
+# instead of per-slice min/max so magnitude stays comparable across slices.
+_SOBEL_MAX_MAG = 4.0 * (2.0 ** 0.5)
+
+
+def apply_sobel(x: torch.Tensor, blend: float = 0.5, legacy: bool = False) -> torch.Tensor:
+    """Compute Sobel edge magnitude of a (1, H, W) float tensor in [0, 1] and blend
+    it with the original image: x' = (1 - blend) * raw + blend * edge.
+
+    legacy=True reproduces the original behavior: raw image discarded, edge
+    magnitude rescaled per-slice to fill [0, 1]. Kept only for A/B comparison
+    against previously trained models.
+    """
     kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
                       dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
     ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
@@ -28,10 +40,15 @@ def apply_sobel(x: torch.Tensor) -> torch.Tensor:
     gx = F.conv2d(x4d, kx, padding=1)
     gy = F.conv2d(x4d, ky, padding=1)
     mag = torch.sqrt(gx.pow(2) + gy.pow(2)).squeeze(0)
-    vmin, vmax = mag.min(), mag.max()
-    if vmax > vmin:
-        mag = (mag - vmin) / (vmax - vmin)
-    return mag
+
+    if legacy:
+        vmin, vmax = mag.min(), mag.max()
+        if vmax > vmin:
+            mag = (mag - vmin) / (vmax - vmin)
+        return mag
+
+    mag = (mag / _SOBEL_MAX_MAG).clamp(0.0, 1.0)
+    return (1.0 - blend) * x + blend * mag
 
 
 class HRPQCTDatasetV2(Dataset):
@@ -61,6 +78,8 @@ class HRPQCTDatasetV2(Dataset):
         bone_type: Optional[str] = None,
         mmap_mode: Optional[str] = None if os.name == 'nt' else 'r',
         edge_filter: bool = False,
+        edge_blend: float = 0.5,
+        edge_legacy: bool = False,
         grade_filter: Optional[List[int]] = None,
     ):
         self.root = Path(dataset_dir)
@@ -140,6 +159,8 @@ class HRPQCTDatasetV2(Dataset):
         self.p_flip = p_flip
         self.p_rot = p_rot
         self.edge_filter = edge_filter
+        self.edge_blend = edge_blend
+        self.edge_legacy = edge_legacy
 
     def __len__(self):
         return len(self.paths)
@@ -170,7 +191,7 @@ class HRPQCTDatasetV2(Dataset):
         if self.augment:
             x = self._apply_aug(x)
         if self.edge_filter:
-            x = apply_sobel(x)
+            x = apply_sobel(x, blend=self.edge_blend, legacy=self.edge_legacy)
         return x, torch.tensor(y, dtype=torch.long)
 
 

@@ -58,6 +58,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--n_folds", type=int, default=5)
     parser.add_argument("--edge_filter", action="store_true")
+    parser.add_argument("--edge_blend", type=float, default=0.5,
+                        help="Weight given to the edge map when blending with the raw image (0-1)")
+    parser.add_argument("--edge_legacy", action="store_true",
+                        help="Reproduce the old edge-only, per-slice-normalized behavior (for A/B comparison)")
 
     # Epoch counts
     parser.add_argument("--num_epochs_s1", type=int, default=15, help="Stage 1 training epochs")
@@ -132,6 +136,8 @@ def main():
             bone_type=args.bone_type,
             arch=args.arch,
             edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            edge_legacy=args.edge_legacy,
             grade_filter=None,
         )
 
@@ -154,6 +160,8 @@ def main():
             bone_type=args.bone_type,
             arch=args.arch,
             edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            edge_legacy=args.edge_legacy,
             grade_filter=[2, 3, 4, 5],
         )
 
@@ -172,6 +180,8 @@ def main():
             bone_type=args.bone_type,
             arch=args.arch,
             edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            edge_legacy=args.edge_legacy,
             grade_filter=None,
         )
 
@@ -192,6 +202,8 @@ def main():
             bone_type=args.bone_type,
             arch=args.arch,
             edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            edge_legacy=args.edge_legacy,
             grade_filter=[2, 3, 4, 5],
         )
 

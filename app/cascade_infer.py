@@ -60,7 +60,8 @@ def _load_models(stage_dir: str | Path, num_classes: int, arch: str, device: tor
     return models
 
 
-def _infer_slices(models: list, slices_float: list[np.ndarray], edge_filter: bool, device: torch.device) -> tuple[int, float]:
+def _infer_slices(models: list, slices_float: list[np.ndarray], edge_filter: bool,
+                  edge_blend: float, edge_legacy: bool, device: torch.device) -> tuple[int, float]:
     """
     Run ensemble inference on a list of pre-normalized float32 (H, W) numpy arrays.
     Returns (predicted_class, confidence) where confidence is the average winning-class probability.
@@ -71,7 +72,7 @@ def _infer_slices(models: list, slices_float: list[np.ndarray], edge_filter: boo
         for arr in slices_float:
             x = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().to(device)  # (1,1,H,W)
             if edge_filter:
-                x = apply_sobel(x.squeeze(0)).unsqueeze(0)  # keep (1,1,H,W)
+                x = apply_sobel(x.squeeze(0), blend=edge_blend, legacy=edge_legacy).unsqueeze(0)  # keep (1,1,H,W)
 
             ensemble_probs = torch.stack(
                 [F.softmax(m(x), dim=1) for m in models]
@@ -121,9 +122,12 @@ class CascadePredictor:
     Call predict() for on-the-fly ISQ inference or predict_debug() for pre-processed .npy.
     """
 
-    def __init__(self, arch: Optional[str] = None, edge_filter: Optional[bool] = None):
+    def __init__(self, arch: Optional[str] = None, edge_filter: Optional[bool] = None,
+                edge_blend: Optional[float] = None, edge_legacy: Optional[bool] = None):
         self.arch = arch or config.ARCH
         self.edge_filter = edge_filter if edge_filter is not None else config.EDGE_FILTER
+        self.edge_blend = edge_blend if edge_blend is not None else config.EDGE_BLEND
+        self.edge_legacy = edge_legacy if edge_legacy is not None else config.EDGE_LEGACY
         self.device = torch.device(config.INFERENCE_DEVICE)
         self._models: dict = {}  # bone_type -> {'stage1': [...], 'stage2': [...]}
         self._loaded_bones: set = set()
@@ -157,12 +161,14 @@ class CascadePredictor:
         Returns (bin: 0/1/2, confidence: float, label: str).
         """
         models = self._models[bone_type]
-        s1_pred, s1_conf = _infer_slices(models['stage1'], slices, self.edge_filter, self.device)
+        s1_pred, s1_conf = _infer_slices(models['stage1'], slices, self.edge_filter,
+                                          self.edge_blend, self.edge_legacy, self.device)
 
         if s1_pred == 0:
             return 0, s1_conf, config.GRADE_BIN_LABELS[0]
 
-        s2_pred, s2_conf = _infer_slices(models['stage2'], slices, self.edge_filter, self.device)
+        s2_pred, s2_conf = _infer_slices(models['stage2'], slices, self.edge_filter,
+                                          self.edge_blend, self.edge_legacy, self.device)
         combined_conf = (s1_conf + s2_conf) / 2
         grade_bin = 1 if s2_pred == 0 else 2
         return grade_bin, combined_conf, config.GRADE_BIN_LABELS[grade_bin]

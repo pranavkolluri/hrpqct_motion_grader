@@ -24,7 +24,6 @@ models/ensemble/
 *.isq
 *.ISQ
 
-# MLflow
 mlruns/
 
 # Temp files from dataset building
