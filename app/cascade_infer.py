@@ -18,6 +18,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TRAINING = os.path.join(_ROOT, 'training')
@@ -34,7 +35,8 @@ from isq_reader import read_isq
 from csv_path_resolver import first_isq
 
 
-def _load_models(stage_dir: str | Path, num_classes: int, arch: str, device: torch.device) -> list:
+def _load_models(stage_dir: str | Path, num_classes: int, arch: str, device: torch.device,
+                 in_channels: int = 1, mil: bool = False) -> list:
     """Load all model_*.pt from a stage dir.
 
     Handles three layouts:
@@ -53,7 +55,7 @@ def _load_models(stage_dir: str | Path, num_classes: int, arch: str, device: tor
 
     models = []
     for path in files:
-        m = build_model(num_classes, arch)
+        m = build_model(num_classes, arch, in_channels=in_channels, mil=mil)
         m.load_state_dict(torch.load(path, map_location=device))
         m.to(device).eval()
         models.append(m)
@@ -82,6 +84,43 @@ def _infer_slices(models: list, slices_float: list[np.ndarray], edge_filter: boo
     avg_probs = np.mean(all_slice_probs, axis=0)
     pred = int(np.argmax(avg_probs))
     confidence = float(avg_probs[pred])
+    return pred, confidence
+
+
+def _build_bag(slices_float: list[np.ndarray], z_context: int, input_size: Optional[int]) -> torch.Tensor:
+    """Stack each slice with its z-neighbors into (N, z_context, H, W), edge-replicated
+    at the volume ends — mirrors HRPQCTBagDataset's instance construction."""
+    n = len(slices_float)
+    half = z_context // 2
+    instances = [
+        np.stack([slices_float[min(max(pos + off, 0), n - 1)] for off in range(-half, half + 1)], axis=0)
+        for pos in range(n)
+    ]
+    bag = torch.from_numpy(np.stack(instances, axis=0).astype(np.float32))  # (N, z_context, H, W)
+    if input_size is not None:
+        n_, c_, h_, w_ = bag.shape
+        bag = TF.resize(bag.reshape(n_ * c_, h_, w_), [input_size, input_size],
+                        antialias=True).reshape(n_, c_, input_size, input_size)
+    return bag
+
+
+def _infer_slices_mil(models: list, slices_float: list[np.ndarray], edge_filter: bool,
+                      edge_blend: float, z_context: int, mil_input_size: Optional[int],
+                      device: torch.device) -> tuple[int, float]:
+    """Attention-MIL inference: one bag forward pass per model instead of
+    per-slice predictions averaged after the fact."""
+    bag = _build_bag(slices_float, z_context, mil_input_size).to(device)
+    if edge_filter:
+        n_, c_, h_, w_ = bag.shape
+        bag = apply_sobel(bag.reshape(n_ * c_, h_, w_), blend=edge_blend).reshape(n_, c_, h_, w_)
+
+    with torch.no_grad():
+        ensemble_probs = torch.stack(
+            [F.softmax(m(bag)[0], dim=1) for m in models]
+        ).mean(0).cpu().numpy()[0]
+
+    pred = int(np.argmax(ensemble_probs))
+    confidence = float(ensemble_probs[pred])
     return pred, confidence
 
 
@@ -123,11 +162,16 @@ class CascadePredictor:
     """
 
     def __init__(self, arch: Optional[str] = None, edge_filter: Optional[bool] = None,
-                edge_blend: Optional[float] = None, edge_legacy: Optional[bool] = None):
+                edge_blend: Optional[float] = None, edge_legacy: Optional[bool] = None,
+                aggregation: Optional[str] = None, z_context: Optional[int] = None,
+                mil_input_size: Optional[int] = None):
         self.arch = arch or config.ARCH
         self.edge_filter = edge_filter if edge_filter is not None else config.EDGE_FILTER
         self.edge_blend = edge_blend if edge_blend is not None else config.EDGE_BLEND
         self.edge_legacy = edge_legacy if edge_legacy is not None else config.EDGE_LEGACY
+        self.aggregation = aggregation or config.AGGREGATION
+        self.z_context = z_context if z_context is not None else config.Z_CONTEXT
+        self.mil_input_size = mil_input_size if mil_input_size is not None else config.MIL_INPUT_SIZE
         self.device = torch.device(config.INFERENCE_DEVICE)
         self._models: dict = {}  # bone_type -> {'stage1': [...], 'stage2': [...]}
         self._loaded_bones: set = set()
@@ -148,10 +192,15 @@ class CascadePredictor:
         if not s2_dir.exists() or not any(s2_dir.rglob("model_*.pt")):
             raise FileNotFoundError(f"Stage 2 models not found at {s2_dir}")
 
+        mil = self.aggregation == "attention"
+        in_channels = self.z_context if mil else 1
+
         print(f"  Loading {bone_type} stage 1 and 2 from {s1_dir} and {s2_dir}...")
         self._models[bone_type] = {
-            'stage1': _load_models(s1_dir, num_classes=2, arch=self.arch, device=self.device),
-            'stage2': _load_models(s2_dir, num_classes=2, arch=self.arch, device=self.device),
+            'stage1': _load_models(s1_dir, num_classes=2, arch=self.arch, device=self.device,
+                                   in_channels=in_channels, mil=mil),
+            'stage2': _load_models(s2_dir, num_classes=2, arch=self.arch, device=self.device,
+                                   in_channels=in_channels, mil=mil),
         }
         self._loaded_bones.add(bone_type)
 
@@ -161,14 +210,23 @@ class CascadePredictor:
         Returns (bin: 0/1/2, confidence: float, label: str).
         """
         models = self._models[bone_type]
-        s1_pred, s1_conf = _infer_slices(models['stage1'], slices, self.edge_filter,
-                                          self.edge_blend, self.edge_legacy, self.device)
+
+        if self.aggregation == "attention":
+            s1_pred, s1_conf = _infer_slices_mil(models['stage1'], slices, self.edge_filter,
+                                                 self.edge_blend, self.z_context, self.mil_input_size, self.device)
+        else:
+            s1_pred, s1_conf = _infer_slices(models['stage1'], slices, self.edge_filter,
+                                              self.edge_blend, self.edge_legacy, self.device)
 
         if s1_pred == 0:
             return 0, s1_conf, config.GRADE_BIN_LABELS[0]
 
-        s2_pred, s2_conf = _infer_slices(models['stage2'], slices, self.edge_filter,
-                                          self.edge_blend, self.edge_legacy, self.device)
+        if self.aggregation == "attention":
+            s2_pred, s2_conf = _infer_slices_mil(models['stage2'], slices, self.edge_filter,
+                                                 self.edge_blend, self.z_context, self.mil_input_size, self.device)
+        else:
+            s2_pred, s2_conf = _infer_slices(models['stage2'], slices, self.edge_filter,
+                                              self.edge_blend, self.edge_legacy, self.device)
         combined_conf = (s1_conf + s2_conf) / 2
         grade_bin = 1 if s2_pred == 0 else 2
         return grade_bin, combined_conf, config.GRADE_BIN_LABELS[grade_bin]

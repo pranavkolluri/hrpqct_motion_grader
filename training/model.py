@@ -90,28 +90,41 @@ class motionGradeCNN(nn.Module):
         return F.softmax(self.forward(x), dim=1)
 
 
+def _adapt_stem(old_conv: nn.Conv2d, in_channels: int) -> nn.Conv2d:
+    """Adapt a pretrained RGB stem conv to `in_channels` input channels.
+
+    in_channels == 3 keeps the pretrained weights untouched (e.g. a 3-slice
+    z-context stack lines up exactly with the pretrained 3-channel stem).
+    Otherwise the weights are averaged to 1 channel and repeated (scaled by
+    1/in_channels to keep output magnitude comparable) across in_channels —
+    for in_channels=1 this reduces to the original averaging behavior.
+    """
+    new_conv = nn.Conv2d(in_channels, old_conv.out_channels, kernel_size=old_conv.kernel_size,
+                         stride=old_conv.stride, padding=old_conv.padding, bias=False)
+    if in_channels == old_conv.in_channels:
+        new_conv.weight.data = old_conv.weight.data.clone()
+    else:
+        avg = old_conv.weight.data.mean(dim=1, keepdim=True)
+        new_conv.weight.data = avg.repeat(1, in_channels, 1, 1) / in_channels
+    return new_conv
+
+
 class EfficientNetB0(nn.Module):
     """
-    EfficientNet-B0 for 1-channel input, pretrained on ImageNet.
-    Stem conv is averaged from 3→1 channel to preserve learned edge detectors.
+    EfficientNet-B0 for grayscale (or z-context-stacked) input, pretrained on ImageNet.
+    Stem conv is adapted from 3 channels to `in_channels` — see `_adapt_stem`.
     """
 
-    def __init__(self, num_classes=4, freeze_blocks=7):
+    def __init__(self, num_classes=4, freeze_blocks=7, in_channels=1):
         super().__init__()
         base = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-
-        old_conv = base.features[0][0]
-        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
-                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
-        new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
-        base.features[0][0] = new_conv
+        base.features[0][0] = _adapt_stem(base.features[0][0], in_channels)
 
         self.features = base.features
         self.avgpool = base.avgpool
         self.num_classes = num_classes
-
-        in_features = base.classifier[1].in_features
-        self.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(in_features, num_classes))
+        self.in_features = base.classifier[1].in_features
+        self.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(self.in_features, num_classes))
 
         for i, block in enumerate(self.features):
             if i < freeze_blocks:
@@ -126,28 +139,22 @@ class EfficientNetB0(nn.Module):
 
 
 class ConvNeXtSmall(nn.Module):
-    """ConvNeXt-Small for 1-channel input, pretrained on ImageNet."""
+    """ConvNeXt-Small for grayscale (or z-context-stacked) input, pretrained on ImageNet."""
 
-    def __init__(self, num_classes=4, freeze_stages=6):
+    def __init__(self, num_classes=4, freeze_stages=6, in_channels=1):
         super().__init__()
         base = tv_models.convnext_small(weights=tv_models.ConvNeXt_Small_Weights.IMAGENET1K_V1)
-
-        old_conv = base.features[0][0]
-        new_conv = nn.Conv2d(1, old_conv.out_channels, kernel_size=old_conv.kernel_size,
-                             stride=old_conv.stride, padding=old_conv.padding, bias=False)
-        new_conv.weight.data = old_conv.weight.data.mean(dim=1, keepdim=True)
-        base.features[0][0] = new_conv
+        base.features[0][0] = _adapt_stem(base.features[0][0], in_channels)
 
         self.features = base.features
         self.avgpool = base.avgpool
         self.num_classes = num_classes
-
-        in_features = base.classifier[2].in_features
+        self.in_features = base.classifier[2].in_features
         self.classifier = nn.Sequential(
             base.classifier[0],  # LayerNorm2d
             nn.Flatten(1),
             nn.Dropout(0.3),
-            nn.Linear(in_features, num_classes),
+            nn.Linear(self.in_features, num_classes),
         )
 
         for i, block in enumerate(self.features):
@@ -161,13 +168,72 @@ class ConvNeXtSmall(nn.Module):
         return self.classifier(x)
 
 
-def build_model(num_classes: int, arch: str = 'custom') -> nn.Module:
+class AttentionMIL(nn.Module):
+    """
+    Attention-based multiple-instance learning head (Ilse et al., 2018) over a
+    bag of per-scan slice instances, in place of averaging independent
+    per-slice predictions after the fact. Each instance is embedded through a
+    shared EfficientNet/ConvNeXt backbone, then combined into one scan-level
+    prediction via learned attention weights, so the model can emphasize the
+    slices that actually carry the motion artifact instead of diluting a
+    localized artifact across a mean over the whole volume.
+    """
+
+    def __init__(self, num_classes=4, backbone_arch='efficientnet', in_channels=1,
+                freeze_blocks=7, attn_hidden=128, chunk_size=16):
+        super().__init__()
+        if backbone_arch == 'efficientnet':
+            backbone = EfficientNetB0(num_classes=num_classes, freeze_blocks=freeze_blocks, in_channels=in_channels)
+        elif backbone_arch == 'convnext':
+            backbone = ConvNeXtSmall(num_classes=num_classes, freeze_stages=freeze_blocks, in_channels=in_channels)
+        else:
+            raise ValueError(f"AttentionMIL only supports 'efficientnet' or 'convnext', got {backbone_arch!r}")
+
+        self.features = backbone.features
+        self.avgpool = backbone.avgpool
+        in_features = backbone.in_features
+        self.num_classes = num_classes
+        self.chunk_size = chunk_size
+
+        self.attention = nn.Sequential(
+            nn.Linear(in_features, attn_hidden),
+            nn.Tanh(),
+            nn.Linear(attn_hidden, 1),
+        )
+        self.classifier = nn.Sequential(nn.Dropout(0.3), nn.Linear(in_features, num_classes))
+
+    def embed(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (N, C, H, W) instances -> (N, in_features) embeddings, processed
+        in chunks to bound peak forward-pass memory for large bags."""
+        chunks = []
+        for start in range(0, x.size(0), self.chunk_size):
+            h = self.features(x[start:start + self.chunk_size])
+            h = self.avgpool(h)
+            chunks.append(torch.flatten(h, 1))
+        return torch.cat(chunks, dim=0)
+
+    def forward(self, x: torch.Tensor):
+        """x: (N, C, H, W) — one bag (all instances of one scan).
+        Returns (logits: (1, num_classes), attn_weights: (N,))."""
+        h = self.embed(x)
+        a = torch.softmax(self.attention(h).squeeze(-1), dim=0)
+        bag = (a.unsqueeze(-1) * h).sum(dim=0, keepdim=True)
+        return self.classifier(bag), a
+
+
+def build_model(num_classes: int, arch: str = 'custom', in_channels: int = 1, mil: bool = False) -> nn.Module:
+    if mil:
+        if arch not in ('efficientnet', 'convnext'):
+            raise ValueError(f"MIL mode requires arch 'efficientnet' or 'convnext', got {arch!r}")
+        return AttentionMIL(num_classes=num_classes, backbone_arch=arch, in_channels=in_channels)
     if arch == 'custom':
+        if in_channels != 1:
+            raise ValueError("'custom' arch only supports in_channels=1")
         return motionGradeCNN(num_classes=num_classes)
     elif arch == 'efficientnet':
-        return EfficientNetB0(num_classes=num_classes)
+        return EfficientNetB0(num_classes=num_classes, in_channels=in_channels)
     elif arch == 'convnext':
-        return ConvNeXtSmall(num_classes=num_classes)
+        return ConvNeXtSmall(num_classes=num_classes, in_channels=in_channels)
     else:
         raise ValueError(f"Unknown arch: {arch!r}. Choose 'custom', 'efficientnet', or 'convnext'.")
 
@@ -182,7 +248,12 @@ def set_finetune_mode(model: nn.Module, arch: str, phase: str) -> None:
     if phase == 'head':
         for param in model.parameters():
             param.requires_grad = False
-        if arch in ('efficientnet', 'convnext'):
+        if isinstance(model, AttentionMIL):
+            for param in model.classifier.parameters():
+                param.requires_grad = True
+            for param in model.attention.parameters():
+                param.requires_grad = True
+        elif arch in ('efficientnet', 'convnext'):
             for param in model.classifier.parameters():
                 param.requires_grad = True
         else:

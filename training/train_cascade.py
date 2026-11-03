@@ -35,7 +35,8 @@ for _p in [_ROOT, _THIS, _DATA]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from trainer import kfold_ensemble_trainer, kfold_finetune_trainer, cascade_kfold_eval
+from trainer import (kfold_ensemble_trainer, kfold_finetune_trainer, cascade_kfold_eval,
+                     kfold_mil_ensemble_trainer)
 
 
 def _latest_kfold_dir(models_root: Path, bone_tag: str) -> Path:
@@ -63,6 +64,17 @@ def main():
     parser.add_argument("--edge_legacy", action="store_true",
                         help="Reproduce the old edge-only, per-slice-normalized behavior (for A/B comparison)")
 
+    # Slice aggregation
+    parser.add_argument("--aggregation", choices=["mean", "attention"], default="mean",
+                        help="'mean' averages independent per-slice predictions (original behavior). "
+                             "'attention' trains an attention-MIL model over 2.5D z-context bags instead.")
+    parser.add_argument("--z_context", type=int, default=3,
+                        help="Odd number of neighboring slices stacked as channels per instance (attention mode only)")
+    parser.add_argument("--mil_input_size", type=int, default=224,
+                        help="Resize instances to this resolution before the backbone (attention mode only)")
+    parser.add_argument("--accum_steps", type=int, default=4,
+                        help="Gradient-accumulate over this many scans per optimizer step (attention mode only)")
+
     # Epoch counts
     parser.add_argument("--num_epochs_s1", type=int, default=15, help="Stage 1 training epochs")
     parser.add_argument("--num_epochs_s2", type=int, default=20, help="Stage 2 training epochs")
@@ -87,6 +99,9 @@ def main():
                         help="Stage 2 head-only epochs during fine-tuning")
 
     args = parser.parse_args()
+
+    if args.aggregation == "attention" and args.finetune:
+        parser.error("--aggregation attention does not support --finetune yet; train from scratch")
 
     if torch.cuda.is_available():
         print(f"CUDA: {torch.cuda.get_device_name(0)}")
@@ -162,6 +177,50 @@ def main():
             edge_filter=args.edge_filter,
             edge_blend=args.edge_blend,
             edge_legacy=args.edge_legacy,
+            grade_filter=[2, 3, 4, 5],
+        )
+
+    elif args.aggregation == "attention":
+        print("\n" + "=" * 70)
+        print("STAGE 1 — Train (attention-MIL): Grade 1 vs Rest")
+        print("=" * 70)
+        kfold_mil_ensemble_trainer(
+            num_models=args.num_models,
+            dataset_dir=str(dataset_dir),
+            n_splits=args.n_folds,
+            num_epochs=args.num_epochs_s1,
+            group_map=[[1], [2, 3, 4, 5]],
+            max_per_class=2.0,
+            bone_type=args.bone_type,
+            arch=args.arch,
+            edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            z_context=args.z_context,
+            mil_input_size=args.mil_input_size,
+            accum_steps=args.accum_steps,
+            grade_filter=None,
+        )
+
+        s1_dir = _latest_kfold_dir(models_root, bone_tag)
+        print(f"\nStage 1 saved to: {s1_dir}")
+
+        print("\n" + "=" * 70)
+        print("STAGE 2 — Train (attention-MIL): Grade 2 vs Grade 3-5")
+        print("=" * 70)
+        kfold_mil_ensemble_trainer(
+            num_models=args.num_models,
+            dataset_dir=str(dataset_dir),
+            n_splits=args.n_folds,
+            num_epochs=args.num_epochs_s2,
+            group_map=[[2], [3, 4, 5]],
+            max_per_class=2.0,
+            bone_type=args.bone_type,
+            arch=args.arch,
+            edge_filter=args.edge_filter,
+            edge_blend=args.edge_blend,
+            z_context=args.z_context,
+            mil_input_size=args.mil_input_size,
+            accum_steps=args.accum_steps,
             grade_filter=[2, 3, 4, 5],
         )
 

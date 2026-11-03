@@ -33,6 +33,12 @@ EDGE_BLEND = 0.5         # Edge-vs-raw blend weight (must match the deployed mod
 EDGE_LEGACY = False      # True only for models trained before the blend/fixed-scale change
 CROP_SIZE = 1024         # ISQ crop size in pixels
 
+# 'mean' (per-slice predictions averaged) or 'attention' (2.5D MIL, learned
+# slice weighting) — must match the deployed model's config.json
+AGGREGATION = "mean"
+Z_CONTEXT = 3            # neighboring-slice stack depth, attention mode only
+MIL_INPUT_SIZE = 224     # instance resize resolution, attention mode only
+
 # ── Grade bin labels (shown to operators) ─────────────────────────────────────
 # Keys are model output bins (0, 1, 2). Change the text here if needed.
 GRADE_BIN_LABELS = {

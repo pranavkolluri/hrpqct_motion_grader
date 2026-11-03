@@ -37,6 +37,10 @@ Confidence is reported as the average softmax probability of the winning class a
 
 Both stages use EfficientNet-B0 with a grayscale-adapted stem (3-channel weights averaged to 1-channel). A Sobel edge filter is optionally applied before each forward pass to highlight structural blur patterns consistent with how technicians manually assess motion. By default the edge map is blended with the raw slice (`x' = (1 - edge_blend) * raw + edge_blend * edge`, gradient magnitude normalized by a fixed scale) rather than replacing it outright, so diffuse/smooth motion blur — which shows up as a loss of local contrast rather than a strong gradient — isn't discarded before the model ever sees it. Set `--edge_legacy` to reproduce the original edge-only behavior for comparison against models trained before this change.
 
+Each slice is normally scored independently and the scan-level prediction is the average of its slices' softmax probabilities. Passing `--aggregation attention` switches to an attention-based multiple-instance-learning model instead: each slice is stacked with its `--z_context` neighboring slices as channels (2.5D, default 3) before going through the shared backbone, and a learned attention head combines the per-slice embeddings into one scan-level prediction — so the model can weight the slices that actually carry the artifact instead of diluting a localized one across a mean over the whole volume. Attention mode trains one scan (bag) at a time with gradient accumulated over `--accum_steps` scans per optimizer step, and does not yet support `--finetune`. `cascade_kfold_eval` and the deployed grading app both auto-detect which mode a model was trained in from its `config.json` (`AGGREGATION`/`Z_CONTEXT`/`MIL_INPUT_SIZE` in `config.py` must match for live deployment, same as `EDGE_FILTER`).
+
+Every training run also now restores the epoch with the best validation accuracy before saving the model, rather than whatever the final epoch happened to produce — per-epoch metrics are logged to `model_N_metrics.csv` in each fold directory.
+
 ---
 
 ## Folder Structure
@@ -93,6 +97,9 @@ EDGE_FILTER = True                  # Whether Sobel filter was used during train
 EDGE_BLEND = 0.5                    # Edge-vs-raw blend weight, must match training config.json
 EDGE_LEGACY = False                 # True only for models trained before the blend/fixed-scale change
 CROP_SIZE = 1024                    # ISQ crop size in pixels
+AGGREGATION = "mean"                 # 'mean' or 'attention', must match training config.json
+Z_CONTEXT = 3                        # neighboring-slice stack depth, attention mode only
+MIL_INPUT_SIZE = 224                 # instance resize resolution, attention mode only
 
 MODELS = {
     "Tibia": {
@@ -116,7 +123,7 @@ LOG_FILE = r"logs/grading_log.csv"
 DEBUG_DATASET_DIR = None           # Set to a .npy dataset path to enable debug mode
 ```
 
-The `ARCH`, `EDGE_FILTER`, `EDGE_BLEND`, and `EDGE_LEGACY` values must match what was used during training (recorded in the training run's `config.json`). Mismatches will not cause an error at load time but will produce incorrect predictions.
+The `ARCH`, `EDGE_FILTER`, `EDGE_BLEND`, `EDGE_LEGACY`, `AGGREGATION`, `Z_CONTEXT`, and `MIL_INPUT_SIZE` values must match what was used during training (recorded in the training run's `config.json`). Mismatches will not cause an error at load time but will produce incorrect predictions.
 
 ---
 
@@ -238,6 +245,22 @@ python training\train_cascade.py `
 ```
 
 Add `--edge_legacy` instead of `--edge_blend` to reproduce the original edge-only behavior (raw image discarded, gradient magnitude stretched per-slice) for A/B comparison against models trained before this change.
+
+To train with 2.5D z-context and attention-based slice aggregation instead of mean-pooled per-slice predictions, add `--aggregation attention` (and optionally `--z_context`, `--mil_input_size`, `--accum_steps`):
+
+```powershell
+python training\train_cascade.py `
+  --dataset_dir F:\data\training_dataset `
+  --bone_type Tibia `
+  --arch efficientnet `
+  --edge_filter `
+  --aggregation attention `
+  --z_context 3 `
+  --n_folds 5 `
+  --num_models 1 `
+  --num_epochs_s1 15 `
+  --num_epochs_s2 20
+```
 
 This trains Stage 1 (Grade 1 vs Rest) and Stage 2 (Grade 2 vs Grade 3-5) using stratified k-fold cross-validation, then runs a full cascade evaluation with no data leakage (each scan is evaluated by the fold model that never saw it during training). Results are saved under `models/ensemble/`.
 
@@ -361,6 +384,9 @@ Technicians assess motion grade primarily by examining structural edge sharpness
 
 **Why blend the edge map with the raw image instead of replacing it?**
 Not all motion artifacts are sharp-edge phenomena — diffuse blur and low-contrast smearing reduce local contrast everywhere rather than producing a strong gradient anywhere in particular. Replacing the raw slice outright discarded that signal, and made it worse by rescaling gradient magnitude per-slice to fill `[0, 1]`: a uniformly blurry slice (weak gradients everywhere) got stretched to look like it had full-range sharp edges. The current default blends the two (fixed-scale edge map + raw image) instead of replacing, so both cues reach the model.
+
+**Why attention-based slice aggregation and 2.5D z-context?**
+Averaging independent per-slice predictions treats motion artifacts as if they're spread uniformly through the volume, but they're often localized to a handful of slices — averaging dilutes a severe, localized artifact against a majority of unaffected slices. Attention-MIL instead lets the model learn which slices actually drive the grade. Stacking each slice with its immediate z-neighbors as channels (2.5D) gives the model some volumetric continuity too, since motion streaking typically propagates across adjacent slices rather than appearing in total isolation — without the data and compute cost a full 3D CNN would need on a dataset this size.
 
 **Why k-fold cross-validation rather than a single train/test split?**
 With ~300 scans total, a single split wastes too much data on evaluation and produces unstable accuracy estimates. K-fold ensures every scan is evaluated exactly once by a model that never saw it, giving a reliable estimate of generalisation performance across the full dataset.
